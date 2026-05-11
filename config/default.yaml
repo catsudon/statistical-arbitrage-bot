@@ -1,0 +1,41 @@
+exchange: binance
+quote: USDT
+timeframe: 1h
+cache_dir: .cache/statarb
+log_level: INFO
+
+universe:
+  top_n_by_volume: 50
+  min_quote_volume_usd: 5_000_000
+  min_history_bars: 2000
+  exclude_symbols: [BUSD/USDT, USDC/USDT, FDUSD/USDT, TUSD/USDT, DAI/USDT]
+
+scanner:
+  pairs:
+    pvalue_max: 0.05
+    min_half_life_bars: 6
+    max_half_life_bars: 240
+    min_abs_correlation: 0.7
+    workers: 8
+
+risk:
+  capital_usd: 100_000
+  vol_target_annual: 0.15
+  per_trade_risk_frac: 0.01
+  max_gross_leverage: 3.0
+  max_positions: 10
+  kelly_fraction: 0.25
+
+backtest:
+  fee_bps: 4.0
+  slippage_bps: 2.0
+  funding_bps_per_day: 1.0
+  include_funding: false
+  bar_close_only: true
+
+strategy:
+  zscore:
+    entry: 2.0
+    exit: 0.5
+    stop: 4.0
+    lookback: 200

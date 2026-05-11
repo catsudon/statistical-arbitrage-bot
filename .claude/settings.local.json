@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m compileall -q statarb tests examples)",
+      "Bash(python3.10 -m compileall -q statarb tests examples)",
+      "Bash(python3.10 *)",
+      "Bash(PYTHONPATH=. python3.10 -m pytest tests/ -x -q)"
+    ]
+  }
+}
