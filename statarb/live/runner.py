@@ -6,19 +6,17 @@ Features:
 - Exponential backoff on errors (max 5 min)
 - Startup checklist: credentials, reconciliation, alert on launch
 - Per-cycle equity + drawdown logged every bar
-- Auto pair re-scan: optional PairManager swaps the active pair every N days
+- Multi-slot PairManager: N independent pair positions, auto re-scan
 """
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
 
 import pandas as pd
 
 from ..core.logging import get_logger
-from ..core.types import PairSpec
 from ..data.ccxt_provider import CCXTProvider, panel_closes
 from ..execution.alerts import Alerter
 from ..execution.base import Broker
@@ -36,10 +34,9 @@ _TF_SEC = {
 
 @dataclass
 class RunnerConfig:
-    symbols: list[str]           # universe for price fetching (pair symbols when fixed)
+    symbols: list[str]           # used only in fixed-pair mode
     timeframe: str = "1h"
     history_bars: int = 1500
-    poll_seconds: int = 30
     max_drawdown: float = 0.20
     max_consecutive_errors: int = 10
 
@@ -80,35 +77,28 @@ def run_live(
     strategy: Strategy | None,
     cfg: RunnerConfig,
     alerter: Alerter | None = None,
-    pair_manager=None,                         # PairManager | None
-    strategy_factory: Callable[[PairSpec], Strategy] | None = None,
+    pair_manager=None,    # PairManager | None
 ) -> None:
     """
-    Parameters
-    ----------
-    strategy        : pre-built strategy for fixed-pair mode; pass None for auto mode
-    pair_manager    : PairManager instance for auto re-scan mode
-    strategy_factory: callable (PairSpec) -> Strategy; required when pair_manager is set
+    Fixed-pair mode : pass a pre-built `strategy`, leave `pair_manager=None`
+    Auto-scan mode  : pass `pair_manager` (PairManager), leave `strategy=None`
     """
     alerter = alerter or Alerter()
     state = RunnerState()
     mode = "DRY-RUN" if getattr(broker, "dry_run", True) else "LIVE"
     auto_mode = pair_manager is not None
 
-    log.info("=== statarb %s starting (mode=%s) ===", mode, "AUTO-SCAN" if auto_mode else "FIXED-PAIR")
+    log.info("=== statarb %s starting (%s) ===", mode, "AUTO-SCAN" if auto_mode else "FIXED-PAIR")
 
     # ---- auto mode: initial scan ----
     if auto_mode:
-        log.info("performing initial pair scan …")
-        best = pair_manager.scan_now()
-        if best is None:
-            log.error("initial scan found no cointegrated pairs — aborting")
+        pair_manager.initial_scan()
+        if not pair_manager.active_slots:
+            log.error("initial scan found no pairs — aborting")
             alerter.alert_no_pair()
             return
-        strategy = strategy_factory(best)
-        pair_manager.current_pair = best
-        active_symbols = [best.y, best.x]
-        log.info("initial pair: %s / %s", best.y, best.x)
+        active_symbols = pair_manager.all_symbols
+        log.info("slots after initial scan: %s", pair_manager.slot_summary())
     else:
         active_symbols = cfg.symbols
 
@@ -118,7 +108,11 @@ def run_live(
     prices_init = _latest_prices(provider, active_symbols, cfg.timeframe)
     eq0 = broker.equity(prices_init)
     state.peak_equity = eq0
-    alerter.alert_startup(strategy.name, mode, active_symbols)
+    alerter.alert_startup(
+        strategy.name if strategy else f"auto-{pair_manager.cfg.n_slots}-slots",
+        mode,
+        active_symbols,
+    )
     log.info("starting equity: %.2f USDT", eq0)
 
     # ---- main loop ----
@@ -130,50 +124,33 @@ def run_live(
 
         target = _next_bar_close(cfg.timeframe)
         sleep_for = max(0.0, target.timestamp() - pd.Timestamp.utcnow().timestamp() + 2.0)
-        log.info(
-            "cycle %d — sleeping %.0fs until %s UTC",
-            state.cycle, sleep_for, target.strftime("%H:%M:%S"),
-        )
+        log.info("cycle %d — sleeping %.0fs until %s UTC", state.cycle, sleep_for, target.strftime("%H:%M:%S"))
         time.sleep(sleep_for)
 
         try:
-            # ---- auto mode: check for pair switch ----
+            # ---- auto mode: tick + handle slot switches ----
             if auto_mode:
                 pair_manager.tick()
-                new_pair, switched = pair_manager.maybe_rescan()
-
-                if new_pair is None:
-                    log.warning("rescan found no pairs — keeping current pair or idling")
-                    alerter.alert_no_pair()
-                    state.consecutive_errors += 1
-                    continue
-
-                if switched:
-                    old_pair = pair_manager.current_pair
-                    old_y = old_pair.y if old_pair else "none"
-                    old_x = old_pair.x if old_pair else "none"
-                    log.info("switching pair: %s/%s → %s/%s", old_y, old_x, new_pair.y, new_pair.x)
-
-                    # close existing positions before switching
-                    old_prices = _latest_prices(provider, [old_y, old_x], cfg.timeframe)
-                    try:
+                switches = pair_manager.check_rescans()
+                for sw in switches:
+                    # zero-out exited symbols before fetching new weights
+                    if sw.exited_symbols:
+                        exit_prices = _latest_prices(provider, list(sw.exited_symbols), cfg.timeframe)
                         broker.rebalance_to_weights(
                             pd.Timestamp.utcnow(),
-                            {old_y: 0.0, old_x: 0.0},
-                            old_prices,
+                            {sym: 0.0 for sym in sw.exited_symbols},
+                            exit_prices,
                         )
-                    except Exception as e:
-                        log.warning("could not close old positions: %s", e)
-
                     alerter.alert_pair_switch(
-                        old_y, old_x, new_pair.y, new_pair.x,
-                        new_pair.pvalue, new_pair.half_life,
+                        sw.old_pair.y if sw.old_pair else "none",
+                        sw.old_pair.x if sw.old_pair else "none",
+                        sw.new_pair.y, sw.new_pair.x,
+                        sw.new_pair.pvalue, sw.new_pair.half_life,
                     )
-                    strategy = strategy_factory(new_pair)
-                    active_symbols = [new_pair.y, new_pair.x]
-                    pair_manager.current_pair = new_pair
+                active_symbols = pair_manager.all_symbols
+                log.info("slots: %s", pair_manager.slot_summary())
 
-            # ---- fetch OHLCV ----
+            # ---- fetch OHLCV for all active symbols ----
             end = pd.Timestamp.utcnow()
             start = end - pd.Timedelta(seconds=_TF_SEC[cfg.timeframe] * cfg.history_bars)
             closes = panel_closes(provider, active_symbols, cfg.timeframe, start=start, end=end)
@@ -184,7 +161,13 @@ def run_live(
                 continue
 
             prices = {s: float(closes[s].iloc[-1]) for s in closes.columns}
-            weights = strategy.generate_weights(closes).iloc[-1]
+
+            # ---- generate weights ----
+            if auto_mode:
+                weights = pair_manager.combined_weights(closes)
+            else:
+                weights = strategy.generate_weights(closes).iloc[-1]
+
             broker.rebalance_to_weights(closes.index[-1], weights.to_dict(), prices)
 
             eq = broker.equity(prices)
@@ -222,6 +205,8 @@ def run_live(
 
 
 def _latest_prices(provider: CCXTProvider, symbols: list[str], timeframe: str) -> dict[str, float]:
+    if not symbols:
+        return {}
     closes = panel_closes(
         provider, symbols, timeframe,
         start=pd.Timestamp.utcnow() - pd.Timedelta(hours=10),
