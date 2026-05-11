@@ -97,6 +97,8 @@ class PairManager:
 
     def _fetch_closes(self) -> pd.DataFrame:
         symbols = self.provider.top_by_volume(n=self.cfg.universe_top, quote=self.cfg.quote)
+        log.info("fetching closes for %d symbols  (%dd @ %s) …",
+                 len(symbols), self.cfg.scan_days, self.timeframe)
         end = pd.Timestamp.utcnow()
         start = end - pd.Timedelta(days=self.cfg.scan_days)
         min_bars = int(self.cfg.scan_days * self._bars_per_day * 0.85)

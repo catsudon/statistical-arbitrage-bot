@@ -228,6 +228,7 @@ def paper(
     exit_: float = typer.Option(0.5, "--exit"),
     stop: float = 4.0,
     lookback: int = 200,
+    dashboard: bool = typer.Option(False, "--dashboard", help="show real-time terminal dashboard"),
 ):
     """Dry-run loop — computes weights and logs orders but never touches exchange."""
     provider = CCXTProvider(exchange=exchange)
@@ -237,14 +238,14 @@ def paper(
     if base and x and slots == 1:
         strat = _build_pair_strategy(provider, base, x, timeframe, history_days, use_kalman)
         cfg = RunnerConfig(symbols=[base, x], timeframe=timeframe, max_drawdown=max_drawdown)
-        run_live(provider, broker, strat, cfg, alerter)
+        run_live(provider, broker, strat, cfg, alerter, show_dashboard=dashboard)
     else:
         pm = _build_pair_manager(provider, exchange, quote, timeframe, slots, top,
                                   scan_days, rescan_days, pvalue, use_kalman,
                                   entry, exit_, stop, lookback)
         console.print(f"[green]auto-scan[/green]: {slots} slot(s), top-{top}, scan={scan_days}d, rescan={rescan_days}d")
         cfg = RunnerConfig(symbols=[], timeframe=timeframe, max_drawdown=max_drawdown)
-        run_live(provider, broker, None, cfg, alerter, pair_manager=pm)
+        run_live(provider, broker, None, cfg, alerter, pair_manager=pm, show_dashboard=dashboard)
 
 
 @app.command()
@@ -267,6 +268,7 @@ def live(
     exit_: float = typer.Option(0.5, "--exit"),
     stop: float = 4.0,
     lookback: int = 200,
+    dashboard: bool = typer.Option(False, "--dashboard", help="show real-time terminal dashboard"),
 ):
     """Live trading with real orders. Requires credentials in .env."""
     creds = get_credentials(exchange)
@@ -295,13 +297,13 @@ def live(
     if fixed_mode:
         strat = _build_pair_strategy(provider, base, x, timeframe, history_days, use_kalman)
         cfg = RunnerConfig(symbols=[base, x], timeframe=timeframe, max_drawdown=max_drawdown)
-        run_live(provider, broker, strat, cfg, alerter)
+        run_live(provider, broker, strat, cfg, alerter, show_dashboard=dashboard)
     else:
         pm = _build_pair_manager(provider, exchange, quote, timeframe, slots, top,
                                   scan_days, rescan_days, pvalue, use_kalman,
                                   entry, exit_, stop, lookback)
         cfg = RunnerConfig(symbols=[], timeframe=timeframe, max_drawdown=max_drawdown)
-        run_live(provider, broker, None, cfg, alerter, pair_manager=pm)
+        run_live(provider, broker, None, cfg, alerter, pair_manager=pm, show_dashboard=dashboard)
 
 
 @app.command()

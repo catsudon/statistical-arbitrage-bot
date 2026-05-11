@@ -21,6 +21,7 @@ from ..data.ccxt_provider import CCXTProvider, panel_closes
 from ..execution.alerts import Alerter
 from ..execution.base import Broker
 from ..strategies.base import Strategy
+from .dashboard import Dashboard, DashboardState, SlotInfo
 
 log = get_logger(__name__)
 
@@ -77,7 +78,8 @@ def run_live(
     strategy: Strategy | None,
     cfg: RunnerConfig,
     alerter: Alerter | None = None,
-    pair_manager=None,    # PairManager | None
+    pair_manager=None,          # PairManager | None
+    show_dashboard: bool = False,
 ) -> None:
     """
     Fixed-pair mode : pass a pre-built `strategy`, leave `pair_manager=None`
@@ -88,34 +90,83 @@ def run_live(
     mode = "DRY-RUN" if getattr(broker, "dry_run", True) else "LIVE"
     auto_mode = pair_manager is not None
 
-    log.info("=== statarb %s starting (%s) ===", mode, "AUTO-SCAN" if auto_mode else "FIXED-PAIR")
-
-    # ---- auto mode: initial scan ----
-    if auto_mode:
-        pair_manager.initial_scan()
-        if not pair_manager.active_slots:
-            log.error("initial scan found no pairs — aborting")
-            alerter.alert_no_pair()
-            return
-        active_symbols = pair_manager.all_symbols
-        log.info("slots after initial scan: %s", pair_manager.slot_summary())
-    else:
-        active_symbols = cfg.symbols
-
-    if hasattr(broker, "reconcile_on_startup"):
-        broker.reconcile_on_startup(active_symbols)
-
-    prices_init = _latest_prices(provider, active_symbols, cfg.timeframe)
-    eq0 = broker.equity(prices_init)
-    state.peak_equity = eq0
-    alerter.alert_startup(
-        strategy.name if strategy else f"auto-{pair_manager.cfg.n_slots}-slots",
-        mode,
-        active_symbols,
+    # build dashboard state (used whether or not show_dashboard=True)
+    n_slots = pair_manager.cfg.n_slots if auto_mode else 1
+    dash_state = DashboardState(
+        exchange=getattr(provider, "exchange_id", "—"),
+        timeframe=cfg.timeframe,
+        mode=mode,
+        slots=[SlotInfo(idx=i) for i in range(n_slots)],
     )
-    log.info("starting equity: %.2f USDT", eq0)
+    dashboard = Dashboard(dash_state) if show_dashboard else None
 
-    # ---- main loop ----
+    def _startup_and_loop() -> None:
+        nonlocal strategy
+        log.info("=== statarb %s starting (%s) ===", mode, "AUTO-SCAN" if auto_mode else "FIXED-PAIR")
+
+        # ---- auto mode: initial scan ----
+        if auto_mode:
+            log.info("scanning universe for initial pairs (top-%d, %dd window)…",
+                     pair_manager.cfg.universe_top, pair_manager.cfg.scan_days)
+            pair_manager.initial_scan()
+            if not pair_manager.active_slots:
+                log.error("initial scan found no pairs — aborting")
+                alerter.alert_no_pair()
+                return
+            active_symbols = pair_manager.all_symbols
+            # populate dash_state slots immediately so dashboard shows pairs
+            for sl in pair_manager.slots:
+                if sl.idx < len(dash_state.slots):
+                    ds = dash_state.slots[sl.idx]
+                    if sl.pair:
+                        ds.pair_y = sl.pair.y
+                        ds.pair_x = sl.pair.x
+                        ds.bars_to_rescan = pair_manager._rescan_every
+                        log.info("slot %d watching: %s / %s  (pvalue=%.4f  hl=%.1f)",
+                                 sl.idx, sl.pair.y, sl.pair.x, sl.pair.pvalue, sl.pair.half_life)
+                    else:
+                        log.warning("slot %d: no pair found", sl.idx)
+            if dashboard:
+                dashboard.refresh()
+        else:
+            active_symbols = cfg.symbols
+            if dash_state.slots and cfg.symbols:
+                dash_state.slots[0].pair_y = cfg.symbols[0]
+                dash_state.slots[0].pair_x = cfg.symbols[1] if len(cfg.symbols) > 1 else "—"
+                log.info("watching fixed pair: %s / %s", cfg.symbols[0], cfg.symbols[1] if len(cfg.symbols) > 1 else "—")
+
+        if hasattr(broker, "reconcile_on_startup"):
+            broker.reconcile_on_startup(active_symbols)
+
+        prices_init = _latest_prices(provider, active_symbols, cfg.timeframe)
+        eq0 = broker.equity(prices_init)
+        state.peak_equity = eq0
+        dash_state.equity = eq0
+        dash_state.peak_equity = eq0
+        dash_state.stamp()
+        alerter.alert_startup(
+            strategy.name if strategy else f"auto-{pair_manager.cfg.n_slots}-slots",
+            mode,
+            active_symbols,
+        )
+        log.info("starting equity: %.2f USDT — waiting for next bar close…", eq0)
+
+        _main_loop(provider, broker, strategy, cfg, alerter, pair_manager,
+                   active_symbols, state, dash_state, auto_mode, dashboard)
+
+    # ---- start dashboard FIRST so it captures all log output including scan ----
+    if dashboard:
+        with dashboard:
+            _startup_and_loop()
+    else:
+        _startup_and_loop()
+
+
+def _main_loop(
+    provider, broker, strategy, cfg, alerter, pair_manager,
+    active_symbols, state, dash_state, auto_mode,
+    dashboard=None,
+):
     while True:
         if KILLSWITCH.exists():
             log.info("kill switch active — shutting down")
@@ -124,7 +175,7 @@ def run_live(
 
         target = _next_bar_close(cfg.timeframe)
         sleep_for = max(0.0, target.timestamp() - pd.Timestamp.utcnow().timestamp() + 2.0)
-        log.info("cycle %d — sleeping %.0fs until %s UTC", state.cycle, sleep_for, target.strftime("%H:%M:%S"))
+        log.info("cycle %d — next bar at %s UTC  (%.0fs)", state.cycle, target.strftime("%H:%M:%S"), sleep_for)
         time.sleep(sleep_for)
 
         try:
@@ -177,6 +228,41 @@ def run_live(
 
             dd = state.current_drawdown
             log.info("equity=%.2f  drawdown=%.2f%%", eq, dd * 100)
+
+            # ---- update dashboard state ----
+            dash_state.cycle = state.cycle
+            dash_state.equity = eq
+            dash_state.peak_equity = state.peak_equity
+            dash_state.drawdown = dd
+            dash_state.stamp()
+            if auto_mode:
+                for sl in pair_manager.slots:
+                    if sl.idx < len(dash_state.slots):
+                        ds = dash_state.slots[sl.idx]
+                        if sl.pair:
+                            ds.pair_y = sl.pair.y
+                            ds.pair_x = sl.pair.x
+                            wy = float(weights.get(sl.pair.y, 0.0))
+                            ds.weight_y = wy
+                            ds.position = "LONG" if wy > 0.01 else ("SHORT" if wy < -0.01 else "FLAT")
+                        ds.bars_to_rescan = max(0, pair_manager._rescan_every - sl.bars_since_scan)
+            else:
+                if dash_state.slots:
+                    ds = dash_state.slots[0]
+                    wy = float(weights.get(cfg.symbols[0], 0.0)) if cfg.symbols else 0.0
+                    ds.pair_y = cfg.symbols[0] if cfg.symbols else "—"
+                    ds.pair_x = cfg.symbols[1] if len(cfg.symbols) > 1 else "—"
+                    ds.weight_y = wy
+                    ds.position = "LONG" if wy > 0.01 else ("SHORT" if wy < -0.01 else "FLAT")
+            # capture recent fills from paper broker
+            if hasattr(broker, "fills") and broker.fills:
+                last = broker.fills[-1]
+                dash_state.add_fill(
+                    f"{last.ts.strftime('%H:%M:%S')}  {last.side.value.upper():5s}  "
+                    f"{last.symbol:15s}  {last.qty:.4f} @ {last.price:.4f}  fee {last.fee:.4f}"
+                )
+            if dashboard:
+                dashboard.refresh()
 
             if dd <= -abs(cfg.max_drawdown):
                 alerter.alert_halted(f"drawdown {dd:.1%} breached limit {-cfg.max_drawdown:.1%}", eq)
