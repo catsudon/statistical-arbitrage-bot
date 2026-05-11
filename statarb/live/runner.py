@@ -245,6 +245,8 @@ def _main_loop(
                             wy = float(weights.get(sl.pair.y, 0.0))
                             ds.weight_y = wy
                             ds.position = "LONG" if wy > 0.01 else ("SHORT" if wy < -0.01 else "FLAT")
+                            if sl.strategy is not None:
+                                ds.zscore = sl.strategy.last_zscore
                         ds.bars_to_rescan = max(0, pair_manager._rescan_every - sl.bars_since_scan)
             else:
                 if dash_state.slots:

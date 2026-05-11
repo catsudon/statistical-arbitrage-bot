@@ -35,6 +35,7 @@ class PairsStrategy:
         self.pair = pair
         self.cfg = cfg or PairStrategyConfig()
         self._beta_t: pd.Series | None = None
+        self.last_zscore: float = float("nan")
 
     def fit(self, closes: pd.DataFrame) -> None:
         return  # nothing to fit for static-β; Kalman is online
@@ -44,14 +45,20 @@ class PairsStrategy:
         x = closes[self.pair.x]
         if self.cfg.use_kalman:
             sig = KalmanSpreadSignal(self.cfg.kalman)
-            state, beta_t, _ = sig.generate(np.log(y), np.log(x))
+            state, beta_t, spread = sig.generate(np.log(y), np.log(x))
             beta = beta_t
             self._beta_t = beta_t
+            p = self.cfg.kalman
+            mu = spread.rolling(p.z_lookback, min_periods=p.z_lookback // 4).mean()
+            sd = spread.rolling(p.z_lookback, min_periods=p.z_lookback // 4).std()
+            z = (spread - mu) / sd.replace(0, np.nan)
+            self.last_zscore = float(z.iloc[-1])
         else:
             sig = ZScoreSignal(self.cfg.zscore)
             spread = make_spread(np.log(y), np.log(x), self.pair.beta, self.pair.alpha)
             state = sig.generate(spread)
             beta = pd.Series(self.pair.beta, index=state.index)
+            self.last_zscore = float(sig.zscore(spread).iloc[-1])
 
         # Translate spread-state {-1, 0, +1} into dollar weights per leg.
         # state = +1 ⇒ long y, short x  (long the spread); state = -1 ⇒ opposite.

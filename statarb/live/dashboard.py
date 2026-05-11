@@ -6,12 +6,14 @@ Log messages are captured and shown in the bottom panel instead of stdout.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from rich.layout import Layout
 from rich.live import Live
+from rich.logging import RichHandler
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -31,6 +33,7 @@ class SlotInfo:
     pair_x: str = "—"
     position: str = "FLAT"      # LONG / SHORT / FLAT
     weight_y: float = 0.0
+    zscore: float = float("nan")
     bars_to_rescan: int = 0
 
 
@@ -73,11 +76,21 @@ class _DashHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         try:
             msg = self.format(record)
-            # strip to plain text, trim long lines
             plain = msg.split("\x1b")[0][:110]
             self.state.add_log(plain)
         except Exception:
             pass
+
+
+# ---------- dynamic renderable so auto-refresh re-reads state each tick ----------
+
+class _LiveRenderable:
+    """Calls render_fn() fresh on every Rich refresh cycle."""
+    def __init__(self, render_fn):
+        self._render_fn = render_fn
+
+    def __rich_console__(self, console, options):
+        yield self._render_fn()
 
 
 # ---------- renderer ----------
@@ -88,25 +101,33 @@ class Dashboard:
     def __init__(self, state: DashboardState) -> None:
         self.state = state
         self._live = Live(
-            self._render(),
+            _LiveRenderable(self._render),
             refresh_per_second=2,
             screen=True,
         )
-        # attach log handler to root logger
         self._handler = _DashHandler(state)
-        self._handler.setFormatter(logging.Formatter("%(name)s  %(message)s"))
-        logging.getLogger().addHandler(self._handler)
+        self._handler.setFormatter(logging.Formatter("%(levelname)s  %(name)s  %(message)s"))
+        self._removed_rich_handlers: list[logging.Handler] = []
 
     def __enter__(self) -> "Dashboard":
+        # silence RichHandler while Live owns the screen — logs go to _DashHandler only
+        root = logging.getLogger()
+        self._removed_rich_handlers = [h for h in root.handlers if isinstance(h, RichHandler)]
+        for h in self._removed_rich_handlers:
+            root.removeHandler(h)
+        root.addHandler(self._handler)
         self._live.__enter__()
         return self
 
     def __exit__(self, *args) -> None:
-        logging.getLogger().removeHandler(self._handler)
+        root = logging.getLogger()
+        root.removeHandler(self._handler)
+        for h in self._removed_rich_handlers:
+            root.addHandler(h)
         self._live.__exit__(*args)
 
     def refresh(self) -> None:
-        self._live.update(self._render())
+        pass  # auto-refresh handles it via _LiveRenderable
 
     # ---- layout ----
 
@@ -145,12 +166,13 @@ class Dashboard:
 
     def _slots(self) -> Panel:
         tbl = Table(expand=True, show_header=True, header_style="bold cyan", box=None)
-        tbl.add_column("#",         width=4)
-        tbl.add_column("Y leg",     min_width=12)
-        tbl.add_column("X leg",     min_width=12)
-        tbl.add_column("Position",  width=8)
-        tbl.add_column("Wt Y",      width=8, justify="right")
-        tbl.add_column("Next rescan",           width=20)
+        tbl.add_column("#",           width=4)
+        tbl.add_column("Y leg",       min_width=12)
+        tbl.add_column("X leg",       min_width=12)
+        tbl.add_column("Position",    width=8)
+        tbl.add_column("Wt Y",        width=8,  justify="right")
+        tbl.add_column("Z-score",     width=9,  justify="right")
+        tbl.add_column("Next rescan", width=20)
 
         bpd = _TF_BPD.get(self.state.timeframe, 24)
         for sl in self.state.slots:
@@ -159,6 +181,16 @@ class Dashboard:
                 else "bold red" if sl.position == "SHORT"
                 else "dim"
             )
+            if math.isnan(sl.zscore):
+                z_text = Text("—", style="dim")
+            else:
+                az = abs(sl.zscore)
+                z_style = (
+                    "bold red"    if az >= 2.0
+                    else "yellow" if az >= 1.0
+                    else "green"
+                )
+                z_text = Text(f"{sl.zscore:+.2f}", style=z_style)
             days = sl.bars_to_rescan / bpd
             tbl.add_row(
                 str(sl.idx),
@@ -166,6 +198,7 @@ class Dashboard:
                 sl.pair_x,
                 Text(sl.position, style=pos_style),
                 f"{sl.weight_y:+.3f}",
+                z_text,
                 f"{sl.bars_to_rescan} bars  ({days:.1f}d)",
             )
         return Panel(tbl, title="Pair Slots")
