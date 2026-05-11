@@ -186,47 +186,105 @@ def _build_pair_strategy(provider, base, x, timeframe, history_days, use_kalman)
     return PairsStrategy(pair, PairStrategyConfig(use_kalman=use_kalman, zscore=ZScoreParams()))
 
 
+def _make_strategy_factory(timeframe, history_days, use_kalman, entry, exit_, stop, lookback):
+    """Return a callable (PairSpec) -> Strategy for the auto-scan runner."""
+    from .signals.zscore import ZScoreParams
+    cfg = PairStrategyConfig(
+        use_kalman=use_kalman,
+        zscore=ZScoreParams(entry=entry, exit=exit_, stop=stop, lookback=lookback),
+    )
+    def factory(pair: PairSpec):
+        return PairsStrategy(pair, cfg)
+    return factory
+
+
 @app.command()
 def paper(
-    base: str = typer.Option(..., "--base"),
-    x: str = typer.Option(..., "--x"),
+    base: str = typer.Option(None, "--base", help="fixed base symbol (omit for auto-scan)"),
+    x: str = typer.Option(None, "--x", help="fixed quote symbol (omit for auto-scan)"),
     exchange: str = "binance",
+    quote: str = "USDT",
     timeframe: str = "1h",
     history_days: int = 60,
     use_kalman: bool = False,
     max_drawdown: float = 0.20,
+    # auto-scan options
+    auto_scan: bool = typer.Option(True, "--auto-scan/--no-auto-scan",
+                                   help="periodically re-scan universe and switch pair"),
+    top: int = typer.Option(50, help="universe size for auto-scan"),
+    scan_days: int = typer.Option(90, help="training window per scan (days)"),
+    rescan_days: int = typer.Option(30, help="how often to re-scan (days)"),
+    pvalue: float = 0.05,
+    entry: float = 2.0,
+    exit_: float = typer.Option(0.5, "--exit"),
+    stop: float = 4.0,
+    lookback: int = 200,
 ):
     """Dry-run loop — computes weights and logs orders but never touches exchange."""
+    from .live.pair_manager import PairManager, PairManagerConfig
+
     provider = CCXTProvider(exchange=exchange)
-    strat = _build_pair_strategy(provider, base, x, timeframe, history_days, use_kalman)
     alerter = Alerter()
     broker = CCXTBroker(exchange=exchange, dry_run=True, alerter=alerter)
-    cfg = RunnerConfig(symbols=[base, x], timeframe=timeframe, max_drawdown=max_drawdown)
-    run_live(provider, broker, strat, cfg, alerter)
+
+    if base and x and not auto_scan:
+        # fixed-pair mode
+        strat = _build_pair_strategy(provider, base, x, timeframe, history_days, use_kalman)
+        cfg = RunnerConfig(symbols=[base, x], timeframe=timeframe, max_drawdown=max_drawdown)
+        run_live(provider, broker, strat, cfg, alerter)
+    else:
+        # auto-scan mode
+        pm_cfg = PairManagerConfig(
+            universe_top=top, quote=quote,
+            scan_days=scan_days, rescan_interval_days=rescan_days,
+            pvalue_max=pvalue,
+        )
+        pm = PairManager(provider, pm_cfg, timeframe)
+        factory = _make_strategy_factory(timeframe, history_days, use_kalman, entry, exit_, stop, lookback)
+        cfg = RunnerConfig(symbols=[], timeframe=timeframe, max_drawdown=max_drawdown)
+        console.print(f"[green]auto-scan mode[/green]: top-{top}, scan={scan_days}d, rescan every {rescan_days}d")
+        run_live(provider, broker, None, cfg, alerter, pair_manager=pm, strategy_factory=factory)
 
 
 @app.command()
 def live(
-    base: str = typer.Option(..., "--base"),
-    x: str = typer.Option(..., "--x"),
+    base: str = typer.Option(None, "--base", help="fixed base symbol (omit for auto-scan)"),
+    x: str = typer.Option(None, "--x", help="fixed quote symbol (omit for auto-scan)"),
     exchange: str = "binance",
+    quote: str = "USDT",
     timeframe: str = "1h",
     history_days: int = 60,
     use_kalman: bool = False,
     max_drawdown: float = 0.15,
     yes: bool = typer.Option(False, "--yes", "-y", help="skip confirmation prompt"),
+    # auto-scan options
+    auto_scan: bool = typer.Option(True, "--auto-scan/--no-auto-scan",
+                                   help="periodically re-scan universe and switch pair"),
+    top: int = typer.Option(50, help="universe size for auto-scan"),
+    scan_days: int = typer.Option(90, help="training window per scan (days)"),
+    rescan_days: int = typer.Option(30, help="how often to re-scan (days)"),
+    pvalue: float = 0.05,
+    entry: float = 2.0,
+    exit_: float = typer.Option(0.5, "--exit"),
+    stop: float = 4.0,
+    lookback: int = 200,
 ):
     """Live trading with real orders. Requires credentials in .env."""
+    from .live.pair_manager import PairManager, PairManagerConfig
+
     creds = get_credentials(exchange)
     if not creds.has_credentials:
         console.print(f"[red]no credentials for {exchange} — add to .env first[/red]")
         raise typer.Exit(1)
 
+    fixed_mode = bool(base and x and not auto_scan)
+    pair_label = f"{base} / {x}" if fixed_mode else f"auto-scan top-{top}"
+
     if not yes:
         console.print(
             f"\n[bold yellow]⚠  LIVE TRADING[/bold yellow]\n"
             f"exchange : [bold]{exchange}[/bold]  testnet={creds.testnet}\n"
-            f"pair     : [bold]{base} / {x}[/bold]\n"
+            f"pair     : [bold]{pair_label}[/bold]\n"
             f"halt at  : drawdown > [bold]{max_drawdown:.0%}[/bold]\n"
         )
         confirm = typer.confirm("Send real orders?", default=False)
@@ -234,11 +292,23 @@ def live(
             raise typer.Abort()
 
     provider = CCXTProvider(exchange=exchange)
-    strat = _build_pair_strategy(provider, base, x, timeframe, history_days, use_kalman)
     alerter = Alerter()
     broker = CCXTBroker(exchange=exchange, dry_run=False, alerter=alerter)
-    cfg = RunnerConfig(symbols=[base, x], timeframe=timeframe, max_drawdown=max_drawdown)
-    run_live(provider, broker, strat, cfg, alerter)
+
+    if fixed_mode:
+        strat = _build_pair_strategy(provider, base, x, timeframe, history_days, use_kalman)
+        cfg = RunnerConfig(symbols=[base, x], timeframe=timeframe, max_drawdown=max_drawdown)
+        run_live(provider, broker, strat, cfg, alerter)
+    else:
+        pm_cfg = PairManagerConfig(
+            universe_top=top, quote=quote,
+            scan_days=scan_days, rescan_interval_days=rescan_days,
+            pvalue_max=pvalue,
+        )
+        pm = PairManager(provider, pm_cfg, timeframe)
+        factory = _make_strategy_factory(timeframe, history_days, use_kalman, entry, exit_, stop, lookback)
+        cfg = RunnerConfig(symbols=[], timeframe=timeframe, max_drawdown=max_drawdown)
+        run_live(provider, broker, None, cfg, alerter, pair_manager=pm, strategy_factory=factory)
 
 
 @app.command()

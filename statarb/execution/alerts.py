@@ -91,5 +91,25 @@ class Alerter:
     def alert_error(self, error: str, cycle: int) -> None:
         self.send(f"❌ *Error* (cycle {cycle})\n`{error[:300]}`", level="ERROR")
 
+    def alert_pair_switch(
+        self,
+        old_y: str, old_x: str,
+        new_y: str, new_x: str,
+        pvalue: float, half_life: float,
+    ) -> None:
+        self.send(
+            f"🔄 *Pair switched*\n"
+            f"old: `{old_y}` / `{old_x}`\n"
+            f"new: `{new_y}` / `{new_x}`\n"
+            f"pvalue={pvalue:.4f}  half_life={half_life:.1f}h"
+        )
+
+    def alert_no_pair(self) -> None:
+        self.send(
+            "⚠️ *No cointegrated pair found*\n"
+            "scanner returned no results — waiting for next rescan cycle",
+            level="WARN",
+        )
+
     def alert_shutdown(self, reason: str) -> None:
         self.send(f"🔴 *statarb stopped*\nreason: {reason}")

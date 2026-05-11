@@ -16,7 +16,6 @@ import pandas as pd
 
 from ..core.logging import get_logger
 from ..core.types import Fill, Side
-from ..execution.paper import PaperBroker
 from ..strategies.base import Strategy
 from .costs import CostModel
 from .metrics import BacktestMetrics, compute_metrics
@@ -42,6 +41,7 @@ def event_backtest(
     warmup_bars: int = 250,
     rebalance_every: int = 1,
 ) -> EventResult:
+    from ..execution.paper import PaperBroker
     cost = cost or CostModel()
     broker = PaperBroker(initial_capital=initial_capital, cost=cost)
     strategy.fit(closes.iloc[:warmup_bars])
