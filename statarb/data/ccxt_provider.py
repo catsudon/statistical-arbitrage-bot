@@ -179,7 +179,9 @@ def panel_closes(
     the whole panel to its listing date.
     """
     out: dict[str, pd.Series] = {}
-    for s in symbols:
+    n = len(symbols)
+    for i, s in enumerate(symbols, 1):
+        log.info("[%d/%d] fetching %s", i, n, s)
         df = provider.fetch_ohlcv(s, timeframe, start, end)
         if df.empty:
             continue

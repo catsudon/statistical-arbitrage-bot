@@ -68,6 +68,7 @@ def scan_pairs(closes: pd.DataFrame, cfg: PairsScanConfig | None = None) -> list
     log.info("scanning %d symbols → %d candidate pairs", len(symbols), len(symbols) * (len(symbols) - 1) // 2)
 
     pairs = list(combinations(symbols, 2))
+    log.info("running cointegration tests on %d pairs (%d workers) …", len(pairs), cfg.workers)
 
     def _task(a: str, b: str):
         return _eval_pair(a, b, closes[a], closes[b], cfg)
